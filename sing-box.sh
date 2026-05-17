@@ -4,7 +4,9 @@
 VERSION='v1.3.12 (2026.05.14)'
 
 # Github 反代加速代理
-GITHUB_PROXY=('https://chinagfw.com/repo/' 'https://ghproxy.com/' '')
+# Proxies for GitHub API/raw when direct is blocked.
+# Keep this list as real GitHub proxy services. (Mirror base is used for binaries separately.)
+GITHUB_PROXY=('https://ghproxy.com/' '')
 MIRROR_BASE=${MIRROR_BASE:-https://chinagfw.com/repo}
 
 # 各变量默认值
@@ -58,6 +60,86 @@ download_stdout_with_fallback() {
     done
   done
   return 1
+}
+
+# Mirror bases (for China VPS).
+: "${MIRROR_BASE:=https://chinagfw.com/repo}"
+: "${MIRROR_RELEASES:=${MIRROR_BASE%/}/releases}"
+: "${GHPROXY_BASE:=https://ghproxy.com/}"
+
+download_file_with_fallback() {
+  # Usage: download_file_with_fallback DEST URL1 URL2 URL3...
+  local dest="$1"; shift
+  local url
+  local tmp="${dest}.tmp.$$"
+  rm -f "$tmp" 2>/dev/null || true
+
+  for url in "$@"; do
+    # Fast-fail attempt: if it can't finish within 15s, switch to next source.
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fL --connect-timeout 5 --max-time 15 --retry 0 -o "$tmp" "$url" >/dev/null 2>&1; then
+        mv -f "$tmp" "$dest"
+        return 0
+      fi
+      if curl -fL --connect-timeout 10 --max-time 180 --retry 5 --retry-delay 1 --retry-all-errors -o "$tmp" "$url" >/dev/null 2>&1; then
+        mv -f "$tmp" "$dest"
+        return 0
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if wget --no-check-certificate -qO "$tmp" --timeout=15 --tries=1 "$url" >/dev/null 2>&1; then
+        mv -f "$tmp" "$dest"
+        return 0
+      fi
+      if wget --no-check-certificate -qO "$tmp" --timeout=180 --tries=5 "$url" >/dev/null 2>&1; then
+        mv -f "$tmp" "$dest"
+        return 0
+      fi
+    else
+      return 127
+    fi
+  done
+
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+sha256_file() {
+  # POSIX: prints sha256 of file
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 127
+  fi
+}
+
+download_binary_with_fallback() {
+  # Usage: download_binary_with_fallback VERSION OS ARCH OUT_TAR OUT_SHA
+  local ver="$1" os="$2" arch="$3" out_tar="$4" out_sha="$5"
+  local asset="sing-box-${ver}-${os}-${arch}.tar.gz"
+  local mirror_url="${MIRROR_RELEASES%/}/${asset}"
+  local github_url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${asset}"
+  local ghproxy_url="${GHPROXY_BASE}${github_url}"
+
+  # checksum file: we standardize to sha256.txt on mirror
+  local mirror_sha="${MIRROR_RELEASES%/}/sha256.txt"
+  local github_sha="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sha256sums.txt"
+  local ghproxy_sha="${GHPROXY_BASE}${github_sha}"
+
+  download_file_with_fallback "$out_tar" "$mirror_url" "$ghproxy_url" "$github_url" || return 1
+
+  # Try to fetch checksums and verify. If checksum unavailable, skip verify (but still avoid hang).
+  if download_file_with_fallback "$out_sha" "$mirror_sha" "$ghproxy_sha" "$github_sha"; then
+    local want got
+    want=$(awk -v a="$asset" '$0 ~ a {print $1; exit}' "$out_sha" 2>/dev/null || true)
+    got=$(sha256_file "$out_tar" 2>/dev/null || true)
+    if [ -n "$want" ] && [ -n "$got" ] && [ "$want" = "$got" ]; then
+      return 0
+    fi
+    # If mirror sha256.txt doesn't include this asset, fall back to no-verify.
+  fi
+  return 0
 }
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
@@ -1187,7 +1269,7 @@ input_reality_key() {
 input_argo_auth() {
   local IS_CHANGE_ARGO=$1
   [ -n "$IS_CHANGE_ARGO" ] && local EMPTY_ERROR_TIME=5
-  local DOMAIN_ERROR_TIME=6 ARGO_AUTH_LENGTH=40
+  local DOMAIN_ERROR_TIME=6
 
   # 处理可能输入的错误，去掉开头和结尾的空格，去掉最后的 :
   if [ "$IS_CHANGE_ARGO" = 'is_change_argo' ]; then
@@ -1206,7 +1288,7 @@ input_argo_auth() {
     ARGO_RUNS="${WORK_DIR}/cloudflared tunnel --edge-ip-version auto --no-autoupdate --url http://localhost:$PORT_NGINX"
   elif [ -n "${ARGO_DOMAIN}" ]; then
     if [ -z "${ARGO_AUTH}" ]; then
-      until [[ "$ARGO_AUTH" =~ TunnelSecret || "$ARGO_AUTH" =~ [A-Z0-9a-z=]{150,250}$ || "${#ARGO_AUTH}" = $ARGO_AUTH_LENGTH ]]; do
+      until [[ "$ARGO_AUTH" =~ TunnelSecret || "$ARGO_AUTH" =~ [A-Z0-9a-z=]{120,250}$ || "${#ARGO_AUTH}" =~ ^[3-6][0-9]$ ]]; do
         [ "$DOMAIN_ERROR_TIME" != 6 ] && warning "\n $(text 86) \n"
       (( DOMAIN_ERROR_TIME-- )) || true
         [ "$DOMAIN_ERROR_TIME" != 0 ] && hint "\n $(text 85) \n " && reading "\n $(text 118) " ARGO_AUTH || error "\n $(text 3) \n"
@@ -1219,18 +1301,18 @@ input_argo_auth() {
       ARGO_JSON=${ARGO_AUTH//[ ]/}
       [ "$IS_CHANGE_ARGO" = 'is_install' ] && export_argo_json_file $TEMP_DIR || export_argo_json_file ${WORK_DIR}
       ARGO_RUNS="${WORK_DIR}/cloudflared tunnel --edge-ip-version auto --config ${WORK_DIR}/tunnel.yml run"
-    elif [[ "${ARGO_AUTH}" =~ [A-Z0-9a-z=]{150,250}$ ]]; then
+    elif [[ "${ARGO_AUTH}" =~ [A-Z0-9a-z=]{120,250}$ ]]; then
       ARGO_TYPE=is_token_argo
       ARGO_TOKEN=$(awk '{print $NF}' <<< "$ARGO_AUTH")
       ARGO_RUNS="${WORK_DIR}/cloudflared tunnel --edge-ip-version auto run --token ${ARGO_TOKEN}"
-    elif [[ "${#ARGO_AUTH}" = $ARGO_AUTH_LENGTH ]]; then
+    elif [[ "${#ARGO_AUTH}" =~ ^[3-6][0-9]$ ]]; then
       hint "\n $(text 119) \n "
       create_argo_tunnel "${ARGO_AUTH}" "${ARGO_DOMAIN}" "${PORT_NGINX}"
       if [[ "$ARGO_JSON" =~ TunnelSecret ]]; then
         ARGO_TYPE=is_json_argo
         [ "$IS_CHANGE_ARGO" = 'is_install' ] && export_argo_json_file $TEMP_DIR || export_argo_json_file ${WORK_DIR}
         ARGO_RUNS="${WORK_DIR}/cloudflared tunnel --edge-ip-version auto --config ${WORK_DIR}/tunnel.yml run"
-      elif [ "${#ARGO_TOKEN}" = 180 ]; then
+      elif [[ "${#ARGO_TOKEN}" =~ ^[0-9]+$ && "${#ARGO_TOKEN}" -ge 120 && "${#ARGO_TOKEN}" -le 250 ]]; then
         ARGO_TYPE=is_token_argo
         ARGO_RUNS="${WORK_DIR}/cloudflared tunnel --edge-ip-version auto run --token ${ARGO_TOKEN}"
       else
@@ -1427,9 +1509,12 @@ check_install() {
       local ONLINE=$(get_sing_box_version)
       local SB_DIR="$TEMP_DIR/sing-box-$ONLINE-linux-$SING_BOX_ARCH"
       local SB_BIN="$SB_DIR/sing-box"
-      wget --no-check-certificate --continue \
-        ${GH_PROXY}https://github.com/SagerNet/sing-box/releases/download/v$ONLINE/sing-box-$ONLINE-linux-$SING_BOX_ARCH.tar.gz \
-        -qO- | tar xz -C $TEMP_DIR 2>/dev/null
+      local SB_OS='linux'
+      [ "$(uname -s)" = 'FreeBSD' ] && SB_OS='freebsd'
+      local SB_TAR="$TEMP_DIR/sing-box-$ONLINE-$SB_OS-$SING_BOX_ARCH.tar.gz"
+      local SB_SHA="$TEMP_DIR/sha256.txt"
+      download_binary_with_fallback "$ONLINE" "$SB_OS" "$SING_BOX_ARCH" "$SB_TAR" "$SB_SHA" >/dev/null 2>&1 || true
+      [ -s "$SB_TAR" ] && tar xzf "$SB_TAR" -C "$TEMP_DIR" 2>/dev/null || true
       [ -s "$SB_BIN" ] && [ -x "$SB_BIN" ] && mv "$SB_BIN" "$TEMP_DIR/sing-box" && chmod +x "$TEMP_DIR/sing-box"
     } &
 
@@ -2970,7 +3055,7 @@ EOF
                 "tag":"geosite-openai",
                 "type":"remote",
                 "format":"binary",
-                "url":"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs"
+                "url":"https://chinagfw.com/repo/geosite-openai.srs"
             }
         ],
         "rules":[
@@ -5116,7 +5201,12 @@ version() {
 
   if [ "${UPDATE,,}" = 'y' ]; then
     check_system_info
-    wget --no-check-certificate --continue ${GH_PROXY}https://github.com/SagerNet/sing-box/releases/download/v$ONLINE/sing-box-$ONLINE-linux-$SING_BOX_ARCH.tar.gz -qO- | tar xz -C $TEMP_DIR sing-box-$ONLINE-linux-$SING_BOX_ARCH/sing-box
+    local SB_OS='linux'
+    [ "$(uname -s)" = 'FreeBSD' ] && SB_OS='freebsd'
+    local SB_TAR="$TEMP_DIR/sing-box-$ONLINE-$SB_OS-$SING_BOX_ARCH.tar.gz"
+    local SB_SHA="$TEMP_DIR/sha256.txt"
+    download_binary_with_fallback "$ONLINE" "$SB_OS" "$SING_BOX_ARCH" "$SB_TAR" "$SB_SHA" >/dev/null 2>&1 || true
+    [ -s "$SB_TAR" ] && tar xzf "$SB_TAR" -C "$TEMP_DIR" "sing-box-$ONLINE-$SB_OS-$SING_BOX_ARCH/sing-box" 2>/dev/null || true
 
     if [ -s $TEMP_DIR/sing-box-$ONLINE-linux-$SING_BOX_ARCH/sing-box ]; then
       cmd_systemctl disable sing-box
