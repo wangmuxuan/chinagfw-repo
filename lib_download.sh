@@ -24,29 +24,34 @@ download_with_fallback() {
   rm -f "$tmp"
 
   for url in "$@"; do
-    i=1
-    while [ "$i" -le 3 ]; do
-      _log "Downloading ($i/3): $url"
-      if have_cmd curl; then
-        if curl -fL --connect-timeout 10 --max-time 180 \
-          --retry 2 --retry-delay 1 --retry-all-errors \
-          -o "$tmp" "$url"; then
-          mv -f "$tmp" "$dest"
-          return 0
-        fi
-      elif have_cmd wget; then
-        if wget -T 180 -t 3 -O "$tmp" "$url"; then
-          mv -f "$tmp" "$dest"
-          return 0
-        fi
-      else
-        _log "Neither curl nor wget is installed"
-        rm -f "$tmp"
-        return 127
+    _log "Downloading: $url"
+    if have_cmd curl; then
+      # Fast-fail attempt (<=15s). If it can't finish quickly, switch source.
+      if curl -fL --connect-timeout 5 --max-time 15 --retry 0 -o "$tmp" "$url" >/dev/null 2>&1; then
+        mv -f "$tmp" "$dest"
+        return 0
       fi
-      i=$((i + 1))
-      sleep 1
-    done
+      if curl -fL --connect-timeout 10 --max-time 180 \
+        --retry 5 --retry-delay 1 --retry-all-errors \
+        -o "$tmp" "$url"; then
+        mv -f "$tmp" "$dest"
+        return 0
+      fi
+    elif have_cmd wget; then
+      if wget -T 15 -t 1 -O "$tmp" "$url" >/dev/null 2>&1; then
+        mv -f "$tmp" "$dest"
+        return 0
+      fi
+      if wget -T 180 -t 5 -O "$tmp" "$url"; then
+        mv -f "$tmp" "$dest"
+        return 0
+      fi
+    else
+      _log "Neither curl nor wget is installed"
+      rm -f "$tmp"
+      return 127
+    fi
+    rm -f "$tmp" 2>/dev/null || true
   done
 
   rm -f "$tmp"
@@ -63,4 +68,3 @@ github_url_chain() {
   ghproxy="$GHPROXY_BASE$origin"
   printf '%s\n' "$mirror" "$ghproxy" "$origin"
 }
-
